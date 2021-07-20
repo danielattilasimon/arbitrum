@@ -49,9 +49,17 @@ services:
     arb-node:
         volumes:
             - %s:/home/user/state
-        image: arb-validator
+        image: arb-node
         entrypoint: '/home/user/go/bin/arb-node'
-        command: --sequencer %s state %s %s
+        command: >-
+            --node.type=sequencer
+            --persistent.chain=/home/user/state
+            --persistent.global-config=/home/user/state
+            --rollup.machine.filename=arbos.mexe
+            --l1.url=%s
+            --rollup.address=%s
+            --bridge-utils-address=%s
+            %s
         ports:
             - '1235:1235'
             - '8547:8547'
@@ -59,8 +67,14 @@ services:
 """
 
 
-def compose_header(state_abspath, extra_flags, rpc_url, rollup_address):
-    return COMPOSE_HEADER % (state_abspath, extra_flags, rpc_url, rollup_address)
+def compose_header(state_abspath, extra_flags, rpc_url, rollup_address, bridge_utils_address):
+    return COMPOSE_HEADER % (
+        state_abspath,
+        rpc_url,
+        rollup_address,
+        bridge_utils_address,
+        extra_flags
+    )
 
 
 # Parameters: validator id, absolute path to state folder,
@@ -69,10 +83,20 @@ COMPOSE_VALIDATOR = """
     arb-validator%d:
         volumes:
             - %s:/home/user/state
-        image: arb-validator
-        command: state %s %s %s %s %s %s
+        image: arb-node
+        entrypoint: /home/user/go/bin/arb-validator
+        command: >-
+            --persistent.chain=/home/user/state
+            --persistent.global-config=/home/user/state
+            --rollup.machine.filename=arbos.mexe
+            --l1.url=%s
+            --rollup.address=%s
+            --bridge-utils-address=%s
+            --validator.utils-address=%s
+            --validator.wallet-factory-address=%s
+            --validator.strategy=%s
+            %s
 """
-
 
 # Returns one arb-validator declaration for a docker compose file
 def compose_validator(
@@ -81,6 +105,7 @@ def compose_validator(
     extra_flags,
     rpc_url,
     rollup_address,
+    bridge_utils_address,
     validator_utils_address,
     validator_wallet_factory_address,
     strategy,
@@ -90,6 +115,7 @@ def compose_validator(
         state_abspath,
         rpc_url,
         rollup_address,
+        bridge_utils_address,
         validator_utils_address,
         validator_wallet_factory_address,
         strategy,
@@ -125,6 +151,7 @@ def deploy(sudo_flag, build_flag, up_flag, rollup, password):
             rollup_address = data["rollup_address"]
             validator_utils_address = data["validator_utils_address"]
             validator_wallet_factory_address = data["validator_wallet_factory_address"]
+            bridge_utils_address = data["bridge_utils_address"]
             extra_flags = ""
             eth_url = (
                 data["eth_url"]
@@ -133,16 +160,16 @@ def deploy(sudo_flag, build_flag, up_flag, rollup, password):
             )
 
             if not password and "password" in data:
-                extra_flags += " --password=" + data["password"]
+                extra_flags += " --wallet.password=" + data["password"]
             elif password:
-                extra_flags += " --password=" + password
+                extra_flags += " --wallet.password=" + password
             else:
                 raise Exception(
                     "arb_deploy requires validator password through [--password=pass] parameter or in config.json file"
                 )
         if i == 0:
             contents = compose_header(
-                states_path % 0, extra_flags, eth_url, rollup_address
+                states_path % 0, extra_flags, eth_url, rollup_address, bridge_utils_address
             )
         else:
             strategy = "StakeLatest"
@@ -154,6 +181,7 @@ def deploy(sudo_flag, build_flag, up_flag, rollup, password):
                 extra_flags,
                 eth_url,
                 rollup_address,
+                bridge_utils_address,
                 validator_utils_address,
                 validator_wallet_factory_address,
                 strategy,
@@ -183,7 +211,7 @@ def halt_docker(sudo_flag):
         )
 
     # Kill and rm all docker containers and images created by any `arb-deploy`
-    ps = "grep -e 'arb-validator' | awk '{ print $1 }'"
+    ps = "grep -e 'arb-node' | awk '{ print $1 }'"
     if run("docker ps | " + ps, capture_stdout=True, quiet=True, sudo=sudo_flag) != "":
         run(
             "docker kill $("

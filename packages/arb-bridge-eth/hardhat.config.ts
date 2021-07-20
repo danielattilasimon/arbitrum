@@ -27,6 +27,7 @@ task('accounts', 'Prints the list of accounts', async (taskArgs, bre) => {
 
 task('create-chain', 'Creates a rollup chain')
   .addParam('sequencer', "The sequencer's address")
+  .addOptionalParam('whitelist', 'Addresses to be whitelisted in the Inbox')
   .setAction(async (taskArguments, hre) => {
     const machineHash = fs.readFileSync('../MACHINEHASH').toString()
     console.log(
@@ -56,20 +57,58 @@ task('create-chain', 'Creates a rollup chain')
     const ev = rollupCreator.interface.parseLog(
       receipt.logs[receipt.logs.length - 1]
     )
-    console.log(ev)
+    const addresses = {
+      rollupAddress: ev.args[0],
+      inboxAddress: ev.args[1],
+    }
+    console.log(addresses)
+
+    const RollupAdmin = await ethers.getContractFactory('RollupAdminFacet')
+    const rollupAdmin = RollupAdmin.attach(addresses.rollupAddress).connect(
+      deployer
+    )
+
+    if (typeof taskArguments.whitelist === 'string') {
+      const whitelist = (taskArguments.whitelist as string).split(',')
+
+      const Inbox = await ethers.getContractFactory('Inbox')
+      const inbox = Inbox.attach(addresses.inboxAddress).connect(deployer)
+      const inboxWhitelistAddress = await inbox.whitelist()
+
+      const tx = await rollupAdmin.setWhitelistEntries(
+        inboxWhitelistAddress,
+        whitelist,
+        new Array(whitelist.length).fill(true)
+      )
+      await tx.wait()
+    }
 
     // const path = `rollup-${hre.network.name}.json`
     const path = `rollup-${hre.network.name}.json`
-    const output = JSON.stringify({
-      rollupAddress: ev.args[0],
-      inboxAddress: ev.args[1],
-    })
+    const output = JSON.stringify(addresses)
 
     fs.writeFileSync(path, output)
     console.log(
       'New rollup chain created and output written to:',
       `${process.cwd()}:${path}`
     )
+  })
+
+task('whitelist-validators', 'Whitelist a list of validator wallet addresses')
+  .addPositionalParam('rollupAddress', "The rollup chain's address")
+  .addPositionalParam('whitelist', 'The addresses to be whitelisted')
+  .setAction(async ({ rollupAddress, whitelist }, { ethers }) => {
+    const [deployer] = await ethers.getSigners()
+    const RollupAdmin = await ethers.getContractFactory('RollupAdminFacet')
+    const rollupAdmin = RollupAdmin.attach(rollupAddress).connect(deployer)
+
+    const validators = (whitelist as string).split(',')
+
+    const tx = await rollupAdmin.setValidator(
+      validators,
+      new Array(validators.length).fill(true)
+    )
+    await tx.wait()
   })
 
 task('deposit', 'Deposit coins into ethbridge')

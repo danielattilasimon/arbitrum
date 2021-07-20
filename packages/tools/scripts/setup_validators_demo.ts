@@ -1,6 +1,6 @@
 import * as ethers from 'ethers'
-import { EventFragment } from '@ethersproject/abi'
-import { L1Bridge, RollupCreator__factory, Inbox__factory } from 'arb-ts'
+import { Inbox__factory } from 'arb-ts'
+import { ValidatorWalletCreator__factory } from 'arb-ts/dist/lib/abi/factories/ValidatorWalletCreator__factory'
 import * as yargs from 'yargs'
 import * as fs from 'fs-extra'
 import { setupValidatorStates } from './setup_validators'
@@ -14,19 +14,35 @@ const wallet = provider.getSigner(0)
 const root = '../../'
 const rollupsPath = root + 'rollups/'
 
+const clientWallets = [
+  '0x979f020f6f6f71577c09db93ba944c89945f10fade64cfc7eb26137d5816fb76',
+  '0xd26a199ae5b6bed1992439d1840f7cb400d0a55a0c9f796fa67d7c571fbb180e',
+  '0xaf5c2984cb1e2f668ae3fd5bbfe0471f68417efd012493538dcd42692299155b',
+  '0x9af1e691e3db692cc9cad4e87b6490e099eb291e3b434a0d3f014dfd2bb747cc',
+  '0x27e926925fb5903ee038c894d9880f74d3dd6518e23ab5e5651de93327c7dffa',
+].map(key => new ethers.Wallet(key).connect(provider))
+
+const clientAddresses = clientWallets.map(wallet => wallet.address)
+
 export interface RollupCreatedEvent {
   rollupAddress: string
   inboxAddress: string
 }
 
 async function setupRollup(
-  sequencerAddress: string
+  sequencerAddress: string,
+  whitelistAddresses?: string[]
 ): Promise<RollupCreatedEvent> {
   // TODO: is the L2 sequencer the 1st unlocked account in the L1 node?
   const network = 'local_development'
 
   execSync(
-    `yarn workspace arb-bridge-eth hardhat create-chain --sequencer ${sequencerAddress} --network ${network}`
+    'yarn workspace arb-bridge-eth hardhat create-chain ' +
+      `--sequencer ${sequencerAddress} ` +
+      (whitelistAddresses
+        ? `--whitelist ${whitelistAddresses.join(',')} `
+        : '') +
+      `--network ${network}`
   )
 
   const fileName = `rollup-${network}.json`
@@ -43,7 +59,7 @@ async function initializeWallets(count: number): Promise<ethers.Wallet[]> {
   const wallets: ethers.Wallet[] = []
   const waits = []
   for (let i = 0; i < count; i++) {
-    const newWallet = ethers.Wallet.createRandom()
+    const newWallet = ethers.Wallet.createRandom().connect(provider)
     const tx = {
       to: newWallet.address,
       value: ethers.utils.parseEther('5.0'),
@@ -56,20 +72,22 @@ async function initializeWallets(count: number): Promise<ethers.Wallet[]> {
   return wallets
 }
 
-async function initializeClientWallets(inboxAddress: string): Promise<void> {
-  const addresses = [
-    '0xc7711f36b2C13E00821fFD9EC54B04A60AEfbd1b',
-    '0x38299D74a169e68df4Da85Fb12c6Fd22246aDD9F',
-    '0xAf40F7D235A9786a420bb89B188910958fD7EF93',
-    '0xFcC598b3E3575CA937AF7F0E804a8BAb5E92a3f6',
-    '0x755449b9901f91deC52DB39AF8c655206C63eD8e',
-  ]
-
-  const inbox = Inbox__factory.connect(inboxAddress, wallet)
+async function initializeClientWallets(
+  inboxAddress: string,
+  clientWallets: ethers.Wallet[]
+): Promise<void> {
   const amount = ethers.utils.parseEther('100')
 
-  for (const address of addresses) {
-    await inbox.depositEth(address, { value: amount })
+  for (const clientWallet of clientWallets) {
+    const sendTx = await wallet.sendTransaction({
+      to: clientWallet.address,
+      value: amount,
+    })
+    await sendTx.wait()
+
+    const inbox = Inbox__factory.connect(inboxAddress, clientWallet)
+    const depositTx = await inbox.depositEth(0, { value: amount })
+    await depositTx.wait()
   }
 }
 
@@ -80,7 +98,8 @@ async function setupValidators(
 ): Promise<void> {
   const wallets = await initializeWallets(count)
   const { rollupAddress, inboxAddress } = await setupRollup(
-    await wallets[0].getAddress()
+    wallets[0].address,
+    clientAddresses
   )
   console.log('Created rollup', rollupAddress)
 
@@ -110,6 +129,7 @@ async function setupValidators(
     validator_utils_address: addresses['contracts']['ValidatorUtils'].address,
     validator_wallet_factory_address:
       addresses['contracts']['ValidatorWalletCreator'].address,
+    bridge_utils_address: addresses['contracts']['BridgeUtils'].address,
     eth_url: 'http://localhost:7545',
     password: 'pass',
     blocktime: blocktime,
@@ -117,6 +137,7 @@ async function setupValidators(
 
   await setupValidatorStates(count, 'local', config)
 
+  const validatorWalletAddresses = []
   let i = 0
   for (const wallet of wallets) {
     const valPath = validatorsPath + 'validator' + i + '/'
@@ -124,10 +145,39 @@ async function setupValidators(
     fs.mkdirSync(walletPath)
     const encryptedWallet = await wallet.encrypt('pass')
     fs.writeFileSync(walletPath + wallet.address, encryptedWallet)
+
+    if (i > 0) {
+      const validatorWalletCreator = ValidatorWalletCreator__factory.connect(
+        addresses['contracts']['ValidatorWalletCreator'].address,
+        wallets[i]
+      )
+
+      const tx = await validatorWalletCreator.createWallet()
+      const receipt = await tx.wait()
+
+      const ev = validatorWalletCreator.interface.parseLog(
+        receipt.logs[receipt.logs.length - 1]
+      )
+
+      validatorWalletAddresses.push(ev.args[0])
+
+      fs.writeFileSync(
+        valPath + 'chainState.json',
+        JSON.stringify({
+          validatorWallet: ev.args[0],
+        })
+      )
+    }
+
     i++
   }
 
-  await initializeClientWallets(inboxAddress)
+  execSync(
+    `yarn workspace arb-bridge-eth hardhat whitelist-validators ${rollupAddress} ` +
+      validatorWalletAddresses.join(',')
+  )
+
+  await initializeClientWallets(inboxAddress, clientWallets)
 }
 
 if (require.main === module) {
